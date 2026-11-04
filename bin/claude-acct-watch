@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -uo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+KEYS="${CLAUDE_ACCT_KEYS:-$HOME/.cli-proxy-api/.keys}"
+AUTH_DIR="${CLAUDE_ACCT_AUTH_DIR:-$HOME/.cli-proxy-api}"
+STATE="${CLAUDE_ACCT_STATE:-$AUTH_DIR/.watch-state}"
+source "$KEYS"
+PROXY_URL="${PROXY_URL:-http://127.0.0.1:8317}"
+API="$PROXY_URL/v0/management"
+
+notify() {
+  local t="${2//\"/\\\"}" s="${1//\"/\\\"}"
+  osascript -e "display notification \"$t\" with title \"Claude accounts\" subtitle \"$s\" sound name \"Funk\"" 2>/dev/null
+  echo "$(date '+%F %T') $1: $2"
+}
+
+check() {
+  local files
+  files=$(curl -fsS -m 10 -H "Authorization: Bearer $MGMT_KEY" "$API/auth-files") ||
+    { echo "proxy|down|CLIProxyAPI isn't responding — run: brew services restart cliproxyapi"; return; }
+  jq -r '.files[] | select(.provider=="claude" or .type=="claude") | select(.disabled|not) |
+    (.status_message // "" | ascii_downcase) as $m |
+    if .status=="active" and (.unavailable|not) then "\(.label)|ok|"
+    elif ($m|test("quota|rate.?limit|429|exceed")) then "\(.label)|quota|Out of usage — traffic moved to the other account"
+    else "\(.label)|auth|Login problem (\(.status)): \(.status_message // "no detail") — run: claude-acct login" end' <<<"$files"
+  for f in "$AUTH_DIR"/claude-*.json; do
+    [[ -e "$f" ]] || continue
+    [[ $(jq -r '.disabled // false' "$f") == true ]] && continue
+    local exp code
+    exp=$(jq -r '.expired // empty' "$f")
+    [[ -n "$exp" && "$exp" < "$(date -u +%FT%TZ)" ]] && continue
+    code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' https://api.anthropic.com/api/oauth/usage \
+      -H "Authorization: Bearer $(jq -r .access_token "$f")" -H "anthropic-beta: oauth-2025-04-20")
+    [[ "$code" == 401 || "$code" == 403 ]] && echo "$(jq -r .email "$f")|auth|Login rejected by Anthropic ($code) — run: claude-acct login"
+  done
+}
+
+[[ "${1:-}" == test ]] && { notify "Test" "Notifications from claude-acct-watch are working"; exit 0; }
+
+current=$(check | awk -F'|' '{print ($2=="ok") "|" $0}' | sort -t'|' -k1,1n | cut -d'|' -f2- | awk -F'|' '!seen[$1]++' | sort)
+previous=$(cat "$STATE" 2>/dev/null || true)
+while IFS='|' read -r who kind msg; do
+  [[ -z "$who" ]] && continue
+  was=$(grep -F "$who|" <<<"$previous" | cut -d'|' -f2)
+  if [[ "$kind" != ok && "$kind" != "$was" ]]; then notify "$who" "$msg"
+  elif [[ "$kind" == ok && -n "$was" && "$was" != ok ]]; then notify "$who" "Back to normal"
+  fi
+done <<<"$current"
+printf '%s\n' "$current" > "$STATE"

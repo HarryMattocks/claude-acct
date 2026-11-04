@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+KEYS="${CLAUDE_ACCT_KEYS:-$HOME/.cli-proxy-api/.keys}"
+AUTH_DIR="${CLAUDE_ACCT_AUTH_DIR:-$HOME/.cli-proxy-api}"
+[[ -f "$KEYS" ]] || { echo "claude-acct: $KEYS not found — run install.sh first" >&2; exit 1; }
+source "$KEYS"
+PROXY_URL="${PROXY_URL:-http://127.0.0.1:8317}"
+API="$PROXY_URL/v0/management"
+H=(-H "Authorization: Bearer $MGMT_KEY" -H "Content-Type: application/json")
+
+claude_files() {
+  curl -fsS "${H[@]}" "$API/auth-files" | jq -c '.files[] | select(.provider=="claude" or .type=="claude")'
+}
+
+patch() {
+  curl -fsS -X PATCH "${H[@]}" "$API/auth-files/$1" -d "$2" >/dev/null
+}
+
+set_disabled() {
+  patch status "$(jq -nc --arg n "$1" --argjson d "$2" '{name:$n,disabled:$d}')"
+}
+
+set_priority() {
+  patch fields "$(jq -nc --arg n "$1" --argjson p "$2" '{name:$n,priority:$p}')"
+}
+
+match_one() {
+  local hit
+  hit=$(claude_files | jq -r --arg q "$1" 'select((.label // "" | contains($q)) or (.name | contains($q))) | .name')
+  [[ -n "$hit" && $(grep -c . <<<"$hit") -eq 1 ]] || { echo "need exactly one account matching '$1', got:" >&2; echo "${hit:-<none>}" >&2; exit 1; }
+  echo "$hit"
+}
+
+priority_of() {
+  jq -r '.priority // 0' "$AUTH_DIR/$1" 2>/dev/null || echo 0
+}
+
+cmd_list() {
+  claude_files | while read -r f; do
+    name=$(jq -r .name <<<"$f")
+    jq -r --arg p "$(priority_of "$name")" \
+      '"\(if .disabled then "  off" else "  ON " end)  \(.label // .name)  priority=\($p)  \(.status)\(if (.status_message // "") != "" then " (\(.status_message))" else "" end)"' <<<"$f"
+  done
+}
+
+cmd_use() {
+  local hit; hit=$(match_one "$1")
+  claude_files | jq -r .name | while read -r n; do
+    if [[ "$n" == "$hit" ]]; then set_disabled "$n" false; else set_disabled "$n" true; fi
+  done
+  cmd_list
+}
+
+cmd_pool() {
+  claude_files | jq -r .name | while read -r n; do set_disabled "$n" false; done
+  cmd_list
+}
+
+cmd_primary() {
+  local hit; hit=$(match_one "$1")
+  claude_files | jq -r .name | while read -r n; do
+    set_disabled "$n" false
+    if [[ "$n" == "$hit" ]]; then set_priority "$n" 100; else set_priority "$n" 0; fi
+  done
+  cmd_list
+}
+
+cmd_usage() {
+  for f in "$AUTH_DIR"/claude-*.json; do
+    [[ -e "$f" ]] || { echo "no Claude accounts — run: claude-acct login"; return; }
+    curl -fsS -m 15 https://api.anthropic.com/api/oauth/usage \
+      -H "Authorization: Bearer $(jq -r .access_token "$f")" -H "anthropic-beta: oauth-2025-04-20" |
+      jq -r --arg e "$(jq -r .email "$f")" --arg p "$(jq -r '.priority // 0' "$f")" \
+        '"\($e) (priority \($p))", (.limits[]? | select(.is_active) | "  \(.kind): \(.percent)%  resets \(.resets_at[:16])Z")' ||
+      echo "$(jq -r .email "$f"): usage unavailable (login may need refreshing)"
+  done
+}
+
+cmd_env() {
+  cat <<EOF
+export ANTHROPIC_BASE_URL="$PROXY_URL"
+export ANTHROPIC_AUTH_TOKEN="$CLIENT_KEY"
+export ANTHROPIC_API_KEY=""
+EOF
+}
+
+cmd_t3() {
+  local id="claude-proxy" make_default=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --default) make_default=true ;;
+      --id) id="$2"; shift ;;
+      *) echo "usage: claude-acct t3 [--default] [--id <instance-id>]" >&2; exit 1 ;;
+    esac
+    shift
+  done
+  local dir="${T3_USERDATA:-$HOME/.t3/userdata}" settings secrets home="$HOME/.$id"
+  settings="$dir/settings.json"; secrets="$dir/secrets"
+  [[ -d "$dir" ]] || { echo "T3 Code userdata not found at $dir (set T3_USERDATA)" >&2; exit 1; }
+  [[ -f "$settings" ]] || echo '{}' > "$settings"
+  cp "$settings" "$settings.bak-$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$home" "$secrets" && chmod 700 "$secrets"
+  b64() { printf %s "$1" | base64 | tr '+/' '-_' | tr -d '='; }
+  ( umask 077; printf %s "$CLIENT_KEY" > "$secrets/provider-env-$(b64 "$id")-$(b64 ANTHROPIC_AUTH_TOKEN).bin" )
+  local tmp; tmp=$(mktemp)
+  jq --arg id "$id" --arg url "$PROXY_URL" --arg home "~/.$id" --arg mk "$MGMT_KEY" --argjson def "$make_default" '
+    .providerInstances[$id] = {
+      driver: "claudeAgent", displayName: "Claude (proxy)", enabled: true,
+      environment: [
+        {name: "ANTHROPIC_BASE_URL", value: $url, sensitive: false},
+        {name: "ANTHROPIC_AUTH_TOKEN", value: "", sensitive: true, valueRedacted: true},
+        {name: "ANTHROPIC_API_KEY", value: "", sensitive: false}
+      ],
+      config: {homePath: $home}
+    }
+    | .usageLimitSources["claude-acct"] = {kind: "cliproxy", label: "CLIProxyAPI (claude-acct)", url: $url, managementKey: $mk, enabled: true}
+    | if $def then .defaultModelSelection = ((.defaultModelSelection // {model: "claude-opus-5-5"}) + {instanceId: $id}) else . end
+  ' "$settings" > "$tmp" && mv "$tmp" "$settings"
+  echo "T3 Code: added provider instance '$id' (Claude (proxy)) and usage hub$($make_default && echo ', set as default')."
+  echo "T3 Code reloads settings.json automatically; check Settings → Providers."
+}
+
+usage() {
+  cat <<EOF
+usage: claude-acct <command>
+
+  list                  show accounts, priority and status
+  usage                 show live plan usage for each account
+  primary <account>     enable all accounts; prefer <account>, fail over to the rest
+  use <account>         route everything to <account> only (others disabled)
+  pool                  enable all accounts
+  login                 add a Claude account (browser OAuth)
+  env                   print env vars to point any Claude Code client at the proxy
+  t3 [--default]        add a "Claude (proxy)" provider instance to T3 Code
+
+<account> is any unique part of the email or auth filename.
+EOF
+}
+
+case "${1:-list}" in
+  list) cmd_list ;;
+  usage) cmd_usage ;;
+  primary) [[ -n "${2:-}" ]] || { usage; exit 1; }; cmd_primary "$2" ;;
+  use) [[ -n "${2:-}" ]] || { usage; exit 1; }; cmd_use "$2" ;;
+  pool) cmd_pool ;;
+  login) cliproxyapi --claude-login ;;
+  env) cmd_env ;;
+  t3) shift; cmd_t3 "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
