@@ -39,8 +39,13 @@ priority_of() {
 cmd_list() {
   claude_files | while read -r f; do
     name=$(jq -r .name <<<"$f")
-    jq -r --arg p "$(priority_of "$name")" \
-      '"\(if .disabled then "  off" else "  ON " end)  \(.label // .name)  priority=\($p)  \(.status)\(if (.status_message // "") != "" then " (\(.status_message))" else "" end)"' <<<"$f"
+    jq -r --arg p "$(priority_of "$name")" '
+      (.status_message // "" | ascii_downcase) as $m |
+      (if .disabled then "off"
+       elif .unavailable and ($m|test("rate.?limit|quota|429|exceed")) then "out of usage, back \(.next_retry_after // "later" | .[:16])Z"
+       elif .status == "active" then "active"
+       else "\(.status): \(.status_message // "")" end) as $state |
+      "\(if .disabled then "  off" else "  ON " end)  \(.label // .name)  priority=\($p)  \($state)"' <<<"$f"
   done
 }
 
@@ -86,12 +91,14 @@ EOF
 }
 
 cmd_t3() {
-  local id="claude-proxy" make_default=false
+  local id="claude-proxy" make_default=false all=false remove=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --default) make_default=true ;;
+      --all) all=true ;;
+      --remove) remove=true ;;
       --id) id="$2"; shift ;;
-      *) echo "usage: claude-acct t3 [--default] [--id <instance-id>]" >&2; exit 1 ;;
+      *) echo "usage: claude-acct t3 [--all] [--default] [--remove] [--id <instance-id>]" >&2; exit 1 ;;
     esac
     shift
   done
@@ -100,24 +107,47 @@ cmd_t3() {
   [[ -d "$dir" ]] || { echo "T3 Code userdata not found at $dir (set T3_USERDATA)" >&2; exit 1; }
   [[ -f "$settings" ]] || echo '{}' > "$settings"
   cp "$settings" "$settings.bak-$(date +%Y%m%d%H%M%S)"
-  mkdir -p "$home" "$secrets" && chmod 700 "$secrets"
+  mkdir -p "$secrets" && chmod 700 "$secrets"
   b64() { printf %s "$1" | base64 | tr '+/' '-_' | tr -d '='; }
-  ( umask 077; printf %s "$CLIENT_KEY" > "$secrets/provider-env-$(b64 "$id")-$(b64 ANTHROPIC_AUTH_TOKEN).bin" )
-  local tmp; tmp=$(mktemp)
-  jq --arg id "$id" --arg url "$PROXY_URL" --arg home "~/.$id" --arg mk "$MGMT_KEY" --argjson def "$make_default" '
+  secret_file() { echo "$secrets/provider-env-$(b64 "$1")-$(b64 ANTHROPIC_AUTH_TOKEN).bin"; }
+  local env_json tmp; tmp=$(mktemp)
+  env_json=$(jq -nc --arg url "$PROXY_URL" '[
+    {name: "ANTHROPIC_BASE_URL", value: $url, sensitive: false},
+    {name: "ANTHROPIC_AUTH_TOKEN", value: "", sensitive: true, valueRedacted: true},
+    {name: "ANTHROPIC_API_KEY", value: "", sensitive: false}]')
+
+  if $remove; then
+    jq --arg id "$id" '
+      def strip: map(select(.name | IN("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY") | not));
+      del(.providerInstances[$id], .usageLimitSources["claude-acct"])
+      | if .providerInstances.claudeAgent.environment then .providerInstances.claudeAgent.environment |= strip else . end
+      | if .defaultModelSelection.instanceId == $id then .defaultModelSelection.instanceId = "claudeAgent" else . end
+    ' "$settings" > "$tmp" && mv "$tmp" "$settings"
+    rm -f "$(secret_file "$id")" "$(secret_file claudeAgent)"
+    echo "T3 Code: removed '$id', the usage hub, and proxy settings from the default Claude instance."
+    return
+  fi
+
+  mkdir -p "$home"
+  ( umask 077; printf %s "$CLIENT_KEY" > "$(secret_file "$id")"
+    $all && printf %s "$CLIENT_KEY" > "$(secret_file claudeAgent)" )
+  jq --arg id "$id" --arg url "$PROXY_URL" --arg home "~/.$id" --arg mk "$MGMT_KEY" \
+     --argjson env "$env_json" --argjson def "$make_default" --argjson all "$all" '
     .providerInstances[$id] = {
       driver: "claudeAgent", displayName: "Claude (proxy)", enabled: true,
-      environment: [
-        {name: "ANTHROPIC_BASE_URL", value: $url, sensitive: false},
-        {name: "ANTHROPIC_AUTH_TOKEN", value: "", sensitive: true, valueRedacted: true},
-        {name: "ANTHROPIC_API_KEY", value: "", sensitive: false}
-      ],
-      config: {homePath: $home}
+      environment: $env, config: {homePath: $home}
     }
     | .usageLimitSources["claude-acct"] = {kind: "cliproxy", label: "CLIProxyAPI (claude-acct)", url: $url, managementKey: $mk, enabled: true}
-    | if $def then .defaultModelSelection = ((.defaultModelSelection // {model: "claude-opus-5-5"}) + {instanceId: $id}) else . end
+    | if $all then
+        .providerInstances.claudeAgent = ((.providerInstances.claudeAgent // {driver: "claudeAgent"})
+          | .enabled = true
+          | .environment = (((.environment // []) | map(select(.name | IN("ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY") | not))) + $env))
+      else . end
+    | if $def then .defaultModelSelection = ((.defaultModelSelection // {model: "claude-opus-5-5"}) + {instanceId: (if $all then "claudeAgent" else $id end)}) else . end
   ' "$settings" > "$tmp" && mv "$tmp" "$settings"
-  echo "T3 Code: added provider instance '$id' (Claude (proxy)) and usage hub$($make_default && echo ', set as default')."
+  echo "T3 Code: added provider instance '$id' (Claude (proxy)) and usage hub."
+  $all && echo "T3 Code: the default \"Claude\" instance now goes through the proxy too (claude.ai connectors are off in those threads)."
+  $make_default && echo "T3 Code: set $($all && echo '"Claude"' || echo "'$id'") as the default."
   echo "T3 Code reloads settings.json automatically; check Settings → Providers."
 }
 
@@ -132,7 +162,9 @@ usage: claude-acct <command>
   pool                  enable all accounts
   login                 add a Claude account (browser OAuth)
   env                   print env vars to point any Claude Code client at the proxy
-  t3 [--default]        add a "Claude (proxy)" provider instance to T3 Code
+  t3 [--all] [--default]
+                        add a "Claude (proxy)" instance to T3 Code; --all also routes
+                        the default "Claude" instance; --remove undoes it
 
 <account> is any unique part of the email or auth filename.
 EOF

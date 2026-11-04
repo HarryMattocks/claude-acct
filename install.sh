@@ -112,7 +112,7 @@ cat <<EOF
 Done. Next:
   claude-acct login                 # once per Claude account (use a private window for the 2nd)
   claude-acct primary <email>       # prefer one account, fail over to the others
-  claude-acct t3 --default          # optional: add "Claude (proxy)" to T3 Code
+  claude-acct t3 --all --default    # optional: route T3 Code's Claude threads through the proxy
   eval "\$(claude-acct env)"          # or point any Claude Code session at the proxy
   claude-acct-watch test            # check macOS notifications reach you
 EOF

@@ -16,5 +16,6 @@ Left in place (delete manually if you want them gone):
   ~/.cli-proxy-api/                    Claude logins, proxy keys, watch log
   $(brew --prefix 2>/dev/null || echo /opt/homebrew)/etc/cliproxyapi.conf   proxy config
   brew uninstall cliproxyapi           the proxy itself
-  T3 Code: remove "Claude (proxy)" in Settings → Providers
+  T3 Code: run "claude-acct t3 --remove" before uninstalling, or remove
+           "Claude (proxy)" and the ANTHROPIC_* variables in Settings → Providers
 EOF

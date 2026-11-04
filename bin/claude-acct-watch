@@ -22,7 +22,7 @@ check() {
   jq -r '.files[] | select(.provider=="claude" or .type=="claude") | select(.disabled|not) |
     (.status_message // "" | ascii_downcase) as $m |
     if .status=="active" and (.unavailable|not) then "\(.label)|ok|"
-    elif ($m|test("quota|rate.?limit|429|exceed")) then "\(.label)|quota|Out of usage — traffic moved to the other account"
+    elif ($m|test("quota|rate.?limit|429|exceed")) then "\(.label)|quota|Out of usage until \(.next_retry_after // "its reset" | .[:16] | sub("T";" "))Z — traffic moved to the next account"
     else "\(.label)|auth|Login problem (\(.status)): \(.status_message // "no detail") — run: claude-acct login" end' <<<"$files"
   for f in "$AUTH_DIR"/claude-*.json; do
     [[ -e "$f" ]] || continue

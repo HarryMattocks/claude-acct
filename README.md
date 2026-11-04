@@ -23,9 +23,19 @@ Claude Code / T3 Code ──► CLIProxyAPI (127.0.0.1:8317) ──► account A
 ```
 
 - The proxy is set to `fill-first` routing with session affinity. Every request goes to the highest-priority account that is available, and a conversation stays on one account.
-- When Anthropic rejects an account for being over its 5-hour or weekly limit (a 429 with `anthropic-ratelimit-unified-*-status: rejected`), the proxy pauses that account until its reset time. It retries the same request on the next account, so the client never sees the error.
-- Running close to a limit (`allowed_warning`) does not trigger a switch. Only a real rejection does.
+- When Anthropic rejects an account for being over its 5-hour or weekly limit (a 429 with `anthropic-ratelimit-unified-7d-status: rejected` or `-5h-status: rejected`), the proxy pauses that account until its reset time. It retries the same request on the next account, so the client never sees the error.
+- Running close to a limit (`allowed_warning`, up to 99%) does not trigger a switch. Only a real rejection does, so every account is used up before the next one starts.
 - After the reset, new conversations go back to the primary account.
+
+This has been tested against a real exhausted account. The proxy got the 429 from Anthropic, finished the request on the second account, and paused the first until the exact reset time Anthropic reported:
+
+```
+$ claude-acct list
+  ON   work@example.com      priority=100  out of usage, back 2026-11-08T17:00Z
+  ON   personal@example.com  priority=0    active
+```
+
+Only clients that send their requests **through the proxy** get failover. A Claude Code session using its own login talks to Anthropic directly and stops at the limit as usual. See [Which sessions use the proxy](#which-sessions-use-the-proxy).
 
 ## Requirements
 
@@ -64,28 +74,54 @@ claude-acct primary work@  # prefer A, fail over to B
 ### T3 Code
 
 ```sh
-claude-acct t3 --default
+claude-acct t3 --all --default
 ```
 
-This adds a **Claude (proxy)** provider instance to T3 Code and makes it the default. It also adds the proxy as a usage hub. The instance uses its own config directory (`~/.claude-proxy`), so it doesn't conflict with a normal Claude login. T3 Code reloads `settings.json` on its own, and a backup is written next to it first.
+This is the recommended setup. It:
 
-`claude-acct t3` writes to T3 Code's internal settings format, which may change between releases. If it stops working, add the instance by hand under **Settings → Providers → Add instance → Claude**:
+- Routes T3 Code's built-in **Claude** instance through the proxy, so every Claude thread, old and new, gets failover. The instance keeps its normal config directory (`~/.claude`), so your CLAUDE.md, skills, settings and thread history stay as they are.
+- Adds a separate **Claude (proxy)** instance with its own config directory (`~/.claude-proxy`).
+- Adds the proxy as a usage hub, and makes **Claude** the default.
+
+T3 Code reloads `settings.json` on its own, and a backup is written next to it first. Undo it all with `claude-acct t3 --remove`.
+
+Without `--all`, only the **Claude (proxy)** instance uses the proxy, and threads on the built-in **Claude** instance keep using your CLI login. T3 Code can't move an existing thread to an instance with a different config directory, so those threads won't fail over.
+
+> [!NOTE]
+> When a Claude Code session goes through the proxy, it ignores the claude.ai login, so **claude.ai connectors (Slack, Google Drive, Gmail and so on) are off** in those sessions. If you need connectors in T3 Code, skip `--all` and pick **Claude (proxy)** only for threads that need failover.
+
+`claude-acct t3` writes to T3 Code's internal settings format, which may change between releases. If it stops working, set this up by hand under **Settings → Providers**, either on the built-in **Claude** instance or on a new Claude instance:
 
 | Field | Value |
 |---|---|
-| CLAUDE_CONFIG_DIR path | `~/.claude-proxy` |
+| CLAUDE_CONFIG_DIR path | empty for the built-in instance, or e.g. `~/.claude-proxy` for a new one |
 | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8317` |
 | `ANTHROPIC_AUTH_TOKEN` (Sensitive) | `CLIENT_KEY` from `~/.cli-proxy-api/.keys` |
 | `ANTHROPIC_API_KEY` | *(empty)* |
 
 For usage tracking, add a hub under **Settings → Providers → Usage providers → Add hub**. Use the URL `http://127.0.0.1:8317` and `MGMT_KEY` as the management key.
 
-### Claude Code CLI or anything else
+### Claude Code CLI
+
+The CLI is left alone: `claude` in your terminal keeps using whatever account it's logged in to (`/login` to change it). To send a single terminal session through the proxy:
 
 ```sh
-eval "$(claude-acct env)"
-CLAUDE_CONFIG_DIR=~/.claude-proxy claude
+eval "$(claude-acct env)" && claude
 ```
+
+Don't put `claude-acct env` in your shell profile unless you want every terminal session to go through the proxy.
+
+### Which sessions use the proxy
+
+| Session | Goes through the proxy? | Switch accounts with |
+|---|---|---|
+| T3 Code, built-in **Claude**, after `t3 --all` | Yes | automatic, or `claude-acct use/primary` |
+| T3 Code, **Claude (proxy)** | Yes | automatic, or `claude-acct use/primary` |
+| T3 Code, built-in **Claude**, without `--all` | No (CLI login) | `/login` in the Claude CLI |
+| Terminal `claude` | No (CLI login) | `/login` |
+| Terminal `claude` after `eval "$(claude-acct env)"` | Yes | automatic, or `claude-acct use/primary` |
+
+`claude-acct use`, `primary` and `pool` only change the proxy. They have no effect on sessions that use the CLI login.
 
 ## Commands
 
@@ -98,7 +134,7 @@ CLAUDE_CONFIG_DIR=~/.claude-proxy claude
 | `claude-acct pool` | Enable all accounts |
 | `claude-acct login` | Add an account (browser OAuth) |
 | `claude-acct env` | Print `ANTHROPIC_*` exports for the proxy |
-| `claude-acct t3 [--default]` | Add the proxy instance to T3 Code |
+| `claude-acct t3 [--all] [--default]` | Set up T3 Code (see above); `--remove` undoes it |
 | `claude-acct-watch test` | Send a test notification |
 
 `<account>` is any unique part of the email address.
@@ -117,6 +153,14 @@ Changes apply from the next request. Existing conversations keep working because
 | Back to normal | An account that had a problem is healthy again. |
 
 Notifications are sent with `osascript`. If `claude-acct-watch test` shows nothing, allow **Script Editor** in System Settings → Notifications. The log is at `~/.cli-proxy-api/watch.log`.
+
+## Troubleshooting
+
+**A thread hit the limit and didn't switch.** That thread isn't going through the proxy. Check which instance it's on in T3 Code (see [Which sessions use the proxy](#which-sessions-use-the-proxy)), and run `claude-acct t3 --all` if it's the built-in **Claude**. To get unstuck right away, run `/login` in the Claude CLI with the other account.
+
+**`claude-acct usage` shows 100% but the account wasn't paused.** Usage is rounded. Anthropic keeps accepting requests at 99% (`allowed_warning`), and the account is only paused when Anthropic actually rejects a request.
+
+**`claude-acct list` shows an error that isn't about usage.** The login probably needs renewing. Run `claude-acct login` with that account.
 
 ## Files
 
