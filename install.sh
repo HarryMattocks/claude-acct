@@ -72,6 +72,10 @@ routing:
   session-affinity: true
   session-affinity-ttl: "1h"
   session-affinity-rebind-on: "quota"
+observability:
+  logs:
+    logging-to-file: true
+    logs-max-total-size-mb: 50
 EOF
   )
   echo "==> wrote $CONF"
