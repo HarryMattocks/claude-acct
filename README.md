@@ -143,16 +143,16 @@ Changes apply from the next request. Existing conversations keep working because
 
 ## Notifications
 
-`claude-acct-watch` runs every 15 minutes and notifies only when something changes:
+`claude-acct-watch` runs every 15 minutes, and soon after the Mac wakes. Before it checks anything, it renews the login of any enabled account that expires within 90 minutes or shows a login error. This covers the case where the Mac slept through the proxy's own renewal. It then notifies only when something changes:
 
 | Notification | Meaning |
 |---|---|
-| Login problem / Login rejected | The proxy can't renew the login, or Anthropic returns 401/403. Run `claude-acct login`. |
+| Login problem / Login rejected | The login couldn't be renewed, even after a retry, or Anthropic returns 401/403. Run `claude-acct login`. |
 | Out of usage | The account hit a limit and requests moved to the next account. |
 | CLIProxyAPI isn't responding | Run `brew services restart cliproxyapi`. |
 | Back to normal | An account that had a problem is healthy again. |
 
-Notifications are sent with `osascript`. If `claude-acct-watch test` shows nothing, allow **Script Editor** in System Settings → Notifications. The log is at `~/.cli-proxy-api/watch.log`.
+Notifications are sent with `osascript`. If `claude-acct-watch test` shows nothing, allow **Script Editor** in System Settings → Notifications. The log is at `~/.cli-proxy-api/watch.log`, and each renewal attempt is recorded there. The proxy's own log is at `~/.cli-proxy-api/logs/main.log`.
 
 ## Troubleshooting
 
@@ -160,7 +160,7 @@ Notifications are sent with `osascript`. If `claude-acct-watch test` shows nothi
 
 **`claude-acct usage` shows 100% but the account wasn't paused.** Usage is rounded. Anthropic keeps accepting requests at 99% (`allowed_warning`), and the account is only paused when Anthropic actually rejects a request.
 
-**`claude-acct list` shows an error that isn't about usage.** The login probably needs renewing. Run `claude-acct login` with that account.
+**`claude-acct list` shows an error that isn't about usage.** Run `claude-acct-watch` to retry the renewal now. If it still fails, check `~/.cli-proxy-api/logs/main.log` for the reason, then run `claude-acct login` with that account. Logins last 8 hours and are renewed automatically, but a revoked login has to be signed in again.
 
 ## Files
 

@@ -36,7 +36,33 @@ check() {
   done
 }
 
+heal() {
+  local files soon f name exp state
+  files=$(curl -fsS -m 10 -H "Authorization: Bearer $MGMT_KEY" "$API/auth-files") || return
+  soon=$(date -u -v+90M +%FT%TZ)
+  for f in "$AUTH_DIR"/claude-*.json; do
+    [[ -e "$f" ]] || continue
+    [[ $(jq -r '.disabled // false' "$f") == true ]] && continue
+    name=$(basename "$f")
+    exp=$(jq -r '.expired // empty' "$f")
+    state=$(jq -r --arg n "$name" '.files[] | select(.name==$n) |
+      (.status_message // "" | ascii_downcase) as $m |
+      if .status=="active" and (.unavailable|not) then "ok"
+      elif ($m|test("quota|rate.?limit|429|exceed")) then "quota" else "bad" end' <<<"$files")
+    if [[ "$state" == bad || ( -n "$exp" && "$exp" < "$soon" ) ]]; then
+      if curl -fsS -m 30 -o /dev/null -X POST -H "Authorization: Bearer $MGMT_KEY" -H "Content-Type: application/json" \
+           -d "$(jq -nc --arg n "$name" '{name:$n}')" "$API/auth-files/refresh"; then
+        echo "$(date '+%F %T') $name: refreshed (was ${state:-unknown}, expiry ${exp:-?})"
+      else
+        echo "$(date '+%F %T') $name: refresh FAILED (was ${state:-unknown}, expiry ${exp:-?})"
+      fi
+    fi
+  done
+}
+
 [[ "${1:-}" == test ]] && { notify "Test" "Notifications from claude-acct-watch are working"; exit 0; }
+
+heal
 
 current=$(check | awk -F'|' '{print ($2=="ok") "|" $0}' | sort -t'|' -k1,1n | cut -d'|' -f2- | awk -F'|' '!seen[$1]++' | sort)
 previous=$(cat "$STATE" 2>/dev/null || true)
